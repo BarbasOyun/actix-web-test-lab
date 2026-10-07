@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Camera WS Video Stream Test</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            margin: 2rem;
+            background: #1a1a1a;
+            color: #fff;
+        }
+
+        video {
+            width: 480px;
+            height: 360px;
+            background: #000;
+            border-radius: 8px;
+        }
+
+        button {
+            padding: 0.6rem 1.2rem;
+            font-size: 1rem;
+            cursor: pointer;
+            margin-right: 0.5rem;
+        }
+
+        #log {
+            background: #111;
+            padding: 1rem;
+            border-radius: 6px;
+            font-family: monospace;
+            height: 150px;
+            overflow-y: auto;
+            margin-top: 1rem;
+        }
+    </style>
+</head>
+
+<body>
+    <h2>Webcam Binary WebSocket Streamer</h2>
+
+    <video id="webcam" autoplay playsinline muted></video>
+    <br /><br />
+
+    <button id="startBtn">Start Streaming</button>
+    <button id="stopBtn" disabled>Stop</button>
+
+    <div id="log"></div>
+
+    <script>
+        const logEl = document.getElementById('log');
+        function log(msg) {
+            logEl.innerHTML += `[${new Date().toLocaleTimeString()}] ${msg}<br/>`;
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        let ws, mediaRecorder, stream;
+
+        document.getElementById('startBtn').onclick = async () => {
+            // Stream Camera
+            try {
+                // 1. Connect to Actix Web Binary WebSocket Route
+                ws = new WebSocket('wss://127.0.0.1:8080/stream');
+                ws.binaryType = 'arraybuffer'; // Handle raw bytes
+
+                ws.onopen = () => log('WebSocket Connected');
+                ws.onerror = (e) => log('WebSocket Error');
+                ws.onclose = () => log('WebSocket Closed');
+
+                // 2. Capture Camera Video Stream
+                stream = await navigator.mediaDevices.getUserMedia({video: true, audio: false});
+                document.getElementById('webcam').srcObject = stream;
+
+                // 3. Encode Video Chunks (WebM format)
+                mediaRecorder = new MediaRecorder(stream, {mimeType: 'video/webm; codecs=vp8'});
+
+                mediaRecorder.ondataavailable = async (event) => {
+                    if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+                        // Convert Blob to ArrayBuffer and send as binary frame
+                        const buffer = await event.data.arrayBuffer();
+
+                        if (buffer.byteLength < 65536) {
+                            ws.send(buffer);
+                            log(`Sent binary chunk: ${buffer.byteLength} bytes`);
+                        } else {
+                            // Chunk is too large - slice into smaller Uint8Array chunks if needed
+                            for (let offset = 0; offset < buffer.byteLength; offset += 32768) {
+                                const slice = buffer.slice(offset, offset + 32768);
+                                ws.send(slice);
+                                log(`Sent binary chunk: ${slice.byteLength} bytes`);
+                            }
+                        }
+                    }
+                };
+
+                // Emit a slice of video data every 250ms
+                mediaRecorder.start(100);
+
+                document.getElementById('startBtn').disabled = true;
+                document.getElementById('stopBtn').disabled = false;
+            } catch (err) {
+                log(`Error: ${err.message}`);
+            }
+        };
+
+        document.getElementById('stopBtn').onclick = () => {
+            if (mediaRecorder) mediaRecorder.stop();
+            if (stream) stream.getTracks().forEach(t => t.stop());
+            if (ws) ws.close();
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+            log('Streaming stopped');
+        };
+    </script>
+</body>
+
+</html>

@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Live Stream Viewer</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            background: #121212;
+            color: #fff;
+            padding: 2rem;
+        }
+
+        video {
+            width: 640px;
+            height: 480px;
+            background: #000;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+
+<body>
+    <h2>Live Stream Watcher</h2>
+    <video id="player" autoplay controls playsinline></video>
+    <p id="status">Connecting...</p>
+
+    <script>
+        const video = document.getElementById('player');
+        const status = document.getElementById('status');
+
+        // 1. Initialize MediaSource for WebM VP8 video
+        const mediaSource = new MediaSource();
+        video.src = URL.createObjectURL(mediaSource);
+
+        mediaSource.addEventListener('sourceopen', () => {
+            // Must match the codec sent by MediaRecorder on the streamer side
+            const sourceBuffer = mediaSource.addSourceBuffer('video/webm; codecs=vp8');
+
+            const queue = [];
+            let isUpdating = false;
+
+            // Append buffered chunks sequentially without overlapping updates
+            function appendNext() {
+                if (queue.length > 0 && !sourceBuffer.updating) {
+                    const chunk = queue.shift();
+                    sourceBuffer.appendBuffer(chunk);
+                }
+            }
+
+            sourceBuffer.addEventListener('updateend', appendNext);
+
+            // 2. Connect to the WebSocket watch endpoint
+            const ws = new WebSocket('wss://127.0.0.1:8080/watch');
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {status.innerText = 'Connected - Streaming live...';};
+            ws.onclose = () => {status.innerText = 'Disconnected';};
+
+            ws.onmessage = (event) => {
+                if (event.data instanceof ArrayBuffer) {
+                    queue.push(event.data);
+                    appendNext();
+                }
+            };
+        });
+    </script>
+</body>
+
+</html>
