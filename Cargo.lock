@@ -127,6 +127,7 @@ dependencies = [
  "actix-web",
  "actix-ws",
  "chrono",
+ "dotenvy",
  "futures-util",
  "rustls",
  "rustls-pemfile",

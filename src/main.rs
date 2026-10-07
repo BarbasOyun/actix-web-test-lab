@@ -1,11 +1,14 @@
 use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, Responder, get, post, web};
-use std::{fs::File, io::BufReader, sync::Mutex, time::Duration};
+use chrono;
+use dotenvy::dotenv;
+use std::{env, fs::File, io::BufReader, sync::Mutex, time::Duration};
 
-use sea_orm::{Database, DatabaseConnection, EntityTrait, entity::prelude::*};
+// DB Interaction
+use sea_orm::{ConnectOptions, Database, DatabaseConnection, EntityTrait, entity::prelude::*};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use actix_ws::AggregatedMessage;
+// Web Socket
 use futures_util::StreamExt;
 use tokio::sync::broadcast;
 
@@ -76,29 +79,35 @@ struct Info {
 
 struct AppState {
     app_name: String,
-    conn: DatabaseConnection,
+    conn: Option<DatabaseConnection>,
     tx: broadcast::Sender<Vec<u8>>,
     counter: Mutex<i32>, // <- Mutex is necessary to mutate safely across threads
 }
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    // DB + App State
-    // let database_url = "https://locahost:5432";
-    let database_url = "postgres://postgres:mysecretpassword@localhost:5432/postgres";
-    let conn: DatabaseConnection = Database::connect(database_url)
-        .await
-        .expect("Failed to connect to database");
-    let (tx, _) = broadcast::channel::<Vec<u8>>(500);
+async fn db_connection() -> Option<DatabaseConnection> {
+    let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| "DB URL NOT SET".to_string());
 
-    let state = web::Data::new(AppState {
-        app_name: String::from("Sentinel API"),
-        conn,
-        tx,
-        counter: Mutex::new(0),
-    });
+    let mut opt = ConnectOptions::new(db_url);
 
-    // TLS / HTTTPS
+    // Configure connection behavior
+    opt.max_connections(10)
+        .min_connections(1)
+        .connect_timeout(Duration::from_secs(8))
+        .acquire_timeout(Duration::from_secs(8))
+        .idle_timeout(Duration::from_secs(8));
+
+    // Panic on connection fail
+    // let conn = Database::connect(opt).await.unwrap_or_else(|err| {
+    //     eprintln!("Warning: Initial connection failed: {err}");
+    //     panic!("Could not connect to database");
+    // });
+
+    let conn = Database::connect(opt).await;
+
+    return conn.ok();
+}
+
+fn tls_config() -> rustls::ServerConfig {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .unwrap();
@@ -116,10 +125,34 @@ async fn main() -> std::io::Result<()> {
         .unwrap();
 
     // set up TLS config options
-    let tls_config = rustls::ServerConfig::builder()
+    let tls_config: rustls::ServerConfig = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(tls_certs, rustls::pki_types::PrivateKeyDer::Pkcs8(tls_key))
         .unwrap();
+
+    return tls_config;
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    dotenv().ok();
+    let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+
+    // DB Connection
+    let conn = db_connection().await;
+
+    // App State
+    let (tx, _) = broadcast::channel::<Vec<u8>>(500);
+
+    let state = web::Data::new(AppState {
+        app_name: String::from("Sentinel API"),
+        conn,
+        tx,
+        counter: Mutex::new(0),
+    });
+
+    // TLS / HTTPS
+    let tls_config = tls_config();
 
     // Start Server
     HttpServer::new(move || {
@@ -127,28 +160,32 @@ async fn main() -> std::io::Result<()> {
             .app_data(state.clone())
             // Set max payload size to 10MB for all WebSocket routes
             .app_data(web::PayloadConfig::new(10 * 1024 * 1024))
+            // Main Routes
             .service(hello)
+            .service(get_date)
             .service(echo)
             .service(path_test)
             .service(query_test)
             .service(submit)
+            .route("/hey", web::get().to(manual_hello))
+            // DB Routes
             .service(add_temperature)
             .service(add_temperature_test)
-            .service(get_temperatures)
+            .service(get_temperature_range)
             .service(add_humidity)
-            .service(get_humidities)
+            .service(get_humiditie_range)
+            // Web Socket Routes
             .service(publish_stream)
             .service(subscribe_stream)
             .service(ws_publish)
-            .route("/hey", web::get().to(manual_hello))
     })
     .keep_alive(Duration::from_secs(75))
-    .bind_rustls_0_23(("127.0.0.1", 8080), tls_config)?
+    .bind_rustls_0_23(("127.0.0.1", port.parse().unwrap()), tls_config)?
     .run()
     .await
 }
 
-/* #region ROUTES */
+/* #region MAIN ROUTES */
 
 #[get("/")]
 async fn hello(data: web::Data<AppState>) -> impl Responder {
@@ -157,6 +194,12 @@ async fn hello(data: web::Data<AppState>) -> impl Responder {
     *counter += 1; // <- access counter inside MutexGuard
     println!("Counter = {}", counter);
     HttpResponse::Ok().body(format!("Hello {}, {}", app_name, counter))
+}
+
+#[get("/date")]
+async fn get_date(state: web::Data<AppState>) -> impl Responder {
+    let current_date = chrono::Utc::now().naive_utc().date();
+    HttpResponse::Ok().body(format!("current date : {}", current_date.to_string()))
 }
 
 #[post("/echo")]
@@ -197,12 +240,16 @@ async fn add_temperature(
     state: web::Data<AppState>,
     payload: web::Json<Temperature>,
 ) -> impl Responder {
+    let Some(conn) = &state.conn else {
+        return HttpResponse::InternalServerError().body(format!("No DB Connection"));
+    };
+
     let new_entry = temperature::ActiveModel {
         date: sea_orm::Set(payload.date),
         temperature: sea_orm::Set(payload.temperature),
     };
 
-    match new_entry.insert(&state.conn).await {
+    match new_entry.insert(conn).await {
         Ok(inserted) => HttpResponse::Created().json(inserted),
         Err(err) => HttpResponse::InternalServerError().body(err.to_string()),
     }
@@ -210,6 +257,10 @@ async fn add_temperature(
 
 #[post("/temperature_test")]
 async fn add_temperature_test(state: web::Data<AppState>, payload: String) -> impl Responder {
+    let Some(conn) = &state.conn else {
+        return HttpResponse::InternalServerError().body(format!("No DB Connection"));
+    };
+
     println!("Received Raw Payload: '{}'", payload);
 
     // Placeholder data
@@ -218,7 +269,7 @@ async fn add_temperature_test(state: web::Data<AppState>, payload: String) -> im
         temperature: sea_orm::Set(25.0),
     };
 
-    match new_entry.insert(&state.conn).await {
+    match new_entry.insert(conn).await {
         Ok(inserted) => HttpResponse::Created().json(inserted),
         Err(err) => HttpResponse::InternalServerError().body(err.to_string()),
     }
@@ -230,13 +281,21 @@ async fn get_temperature(
     state: web::Data<AppState>,
     date_range: web::Query<DateRange>,
 ) -> web::Json<Temperature> {
+    let Some(conn) = &state.conn else {
+        let current_date = chrono::Utc::now().naive_utc().date();
+        return web::Json(Temperature {
+            date: current_date,
+            temperature: 20.0,
+        });
+    };
+
     let start_date = date_range.start_date;
     let end_date = date_range.end_date;
 
     // Query between date range
     let temperatures = temperature::Entity::find()
         .filter(temperature::Column::Date.between(start_date, end_date))
-        .all(&state.conn)
+        .all(conn)
         .await
         .expect("Failed to fetch temperature data");
 
@@ -256,17 +315,21 @@ async fn get_temperature(
 
 /// Get all Temperatures in the Date Range
 #[get("/temperature")]
-async fn get_temperatures(
+async fn get_temperature_range(
     state: web::Data<AppState>,
     date_range: web::Query<DateRange>,
 ) -> impl Responder {
+    let Some(conn) = &state.conn else {
+        return HttpResponse::InternalServerError().body(format!("No DB Connection"));
+    };
+
     let start_date = date_range.start_date;
     let end_date = date_range.end_date;
 
     // Query between date range
     let temperatures = temperature::Entity::find()
         .filter(temperature::Column::Date.between(start_date, end_date))
-        .all(&state.conn)
+        .all(conn)
         .await
         .expect("Failed to fetch temperature data");
 
@@ -285,12 +348,16 @@ async fn get_temperatures(
 
 #[post("/humidity")]
 async fn add_humidity(state: web::Data<AppState>, payload: web::Json<Humidity>) -> impl Responder {
+    let Some(conn) = &state.conn else {
+        return HttpResponse::InternalServerError().body(format!("No DB Connection"));
+    };
+
     let new_entry = humidity::ActiveModel {
         date: sea_orm::Set(payload.date),
         humidity: sea_orm::Set(payload.humidity),
     };
 
-    match new_entry.insert(&state.conn).await {
+    match new_entry.insert(conn).await {
         Ok(inserted) => HttpResponse::Created().json(inserted),
         Err(err) => HttpResponse::InternalServerError().body(err.to_string()),
     }
@@ -298,17 +365,21 @@ async fn add_humidity(state: web::Data<AppState>, payload: web::Json<Humidity>) 
 
 /// Get all Humidities in the Date Range
 #[get("/humidity")]
-async fn get_humidities(
+async fn get_humiditie_range(
     state: web::Data<AppState>,
     date_range: web::Query<DateRange>,
 ) -> impl Responder {
+    let Some(conn) = &state.conn else {
+        return HttpResponse::InternalServerError().body(format!("No DB Connection"));
+    };
+
     let start_date = date_range.start_date;
     let end_date = date_range.end_date;
 
     // Query between date range
     let humidities = humidity::Entity::find()
         .filter(humidity::Column::Date.between(start_date, end_date))
-        .all(&state.conn)
+        .all(conn)
         .await
         .expect("Failed to fetch humidity data");
 
@@ -329,6 +400,7 @@ async fn get_humidities(
 
 /* #region WEB SOCKETS ROUTES */
 
+/// Connect to a Socket and Send Text Messages
 #[get("/message")]
 pub async fn ws_publish(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error> {
     println!("Connection Attempt");
@@ -354,15 +426,7 @@ pub async fn ws_publish(req: HttpRequest, stream: web::Payload) -> Result<HttpRe
     Ok(response)
 }
 
-fn to_string(message: &actix_ws::Message) -> String {
-    match message {
-        actix_ws::Message::Binary(bytes) => String::from("Bytes"),
-        actix_ws::Message::Ping(p) => String::from("Ping"),
-        actix_ws::Message::Close(reason) => String::from("Close"),
-        _ => String::from("Test"),
-    }
-}
-
+/// Connect to Socket and Send Bytes (Video Stream)
 #[get("/stream")]
 async fn publish_stream(
     req: HttpRequest,
@@ -414,29 +478,20 @@ async fn subscribe_stream(
     stream: web::Payload,
     data: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
-    let (res, mut session, _msg_stream) = actix_ws::handle(&req, stream)?;
+    let (res, session, _msg_stream) = actix_ws::handle(&req, stream)?;
 
     let mut rx = data.tx.subscribe();
 
     actix_web::rt::spawn(async move {
         let mut session = session;
-        
+
         while let Ok(bytes) = rx.recv().await {
             if session.binary(bytes).await.is_err() {
-                break; // Client disconnected
+                println!("Stopped Watching");
+                break;
             }
         }
     });
-
-    // tokio::spawn(async move {
-    //     // Continuous loop reading chunks from broadcast and sending to WebSocket client
-    //     while let Ok(msg) = rx.recv().await {
-    //         if session.binary(msg).await.is_err() {
-    //             // Client disconnected
-    //             break;
-    //         }
-    //     }
-    // });
 
     Ok(res)
 }
