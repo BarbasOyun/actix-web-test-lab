@@ -1,10 +1,14 @@
+mod db_init;
+
 use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, Responder, get, post, web};
 use chrono;
 use dotenvy::dotenv;
 use std::{env, fs::File, io::BufReader, sync::Mutex, time::Duration};
 
 // DB Interaction
-use sea_orm::{ConnectOptions, Database, DatabaseConnection, EntityTrait, entity::prelude::*};
+use sea_orm::{
+    ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryOrder, entity::prelude::*,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -21,7 +25,7 @@ pub mod temperature {
     #[sea_orm(table_name = "temperatures")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
-        pub date: Date,
+        pub date_time: DateTimeUtc,
         pub temperature: f64,
     }
 
@@ -38,7 +42,7 @@ pub mod humidity {
     #[sea_orm(table_name = "humidities")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
-        pub date: Date,
+        pub date_time: DateTimeUtc,
         pub humidity: f64,
     }
 
@@ -52,27 +56,27 @@ pub mod humidity {
 
 /* #region INTERFACE STRUCTS */
 
+#[derive(Deserialize)]
+struct Info {
+    username: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Temperature {
-    date: Date,
+    date_time: DateTimeUtc,
     temperature: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Humidity {
-    date: Date,
+    date_time: DateTimeUtc,
     humidity: f64,
 }
 
 #[derive(Deserialize)]
 struct DateRange {
-    start_date: Date,
-    end_date: Date,
-}
-
-#[derive(Deserialize)]
-struct Info {
-    username: String,
+    start_date: DateTimeUtc,
+    end_date: DateTimeUtc,
 }
 
 /* #endregion */
@@ -104,6 +108,11 @@ async fn db_connection() -> Option<DatabaseConnection> {
 
     let conn = Database::connect(opt).await;
 
+    if let Err(err) = conn {
+        println!("Failed to connect to DB : {}", err);
+        return Option::None;
+    }
+
     return conn.ok();
 }
 
@@ -112,31 +121,46 @@ fn tls_config() -> rustls::ServerConfig {
         .install_default()
         .unwrap();
 
-    let mut certs_file = BufReader::new(File::open("cert.pem").unwrap());
-    let mut key_file = BufReader::new(File::open("key.pem").unwrap());
+    // Get Certificates
+    // let mut certs_file = BufReader::new(File::open("cert.pem").unwrap());
+    // let mut key_file = BufReader::new(File::open("key.pem").unwrap());
+    let mut certs_file = BufReader::new(File::open("certs/cert.pem").unwrap());
+    let mut key_file = BufReader::new(File::open("certs/key.pem").unwrap());
 
-    // load TLS certs and key -> create self signed
-    let tls_certs = rustls_pemfile::certs(&mut certs_file)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    let tls_key = rustls_pemfile::pkcs8_private_keys(&mut key_file)
+    // load TLS certs and key
+    let tls_certs = match rustls_pemfile::certs(&mut certs_file).collect::<Result<Vec<_>, _>>() {
+        Ok(cert) => cert,
+        Err(err) => panic!("Error : {}", err.to_string()),
+    };
+
+    let tls_key = match rustls_pemfile::pkcs8_private_keys(&mut key_file)
         .next()
         .unwrap()
-        .unwrap();
+    {
+        Ok(key) => key,
+        Err(err) => panic!("Error : {}", err.to_string()),
+    };
 
     // set up TLS config options
-    let tls_config: rustls::ServerConfig = rustls::ServerConfig::builder()
+    let tls_config: rustls::ServerConfig = match rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(tls_certs, rustls::pki_types::PrivateKeyDer::Pkcs8(tls_key))
-        .unwrap();
+    {
+        Ok(conf) => conf,
+        Err(err) => panic!("Error : {}", err.to_string()),
+    };
+
+    println!("Certificates loaded");
 
     return tls_config;
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    println!("---APP STARTING---");
     dotenv().ok();
     let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
 
     // DB Connection
     let conn = db_connection().await;
@@ -145,7 +169,7 @@ async fn main() -> std::io::Result<()> {
     let (tx, _) = broadcast::channel::<Vec<u8>>(500);
 
     let state = web::Data::new(AppState {
-        app_name: String::from("Sentinel API"),
+        app_name: String::from("Actix TestLab"),
         conn,
         tx,
         counter: Mutex::new(0),
@@ -162,15 +186,15 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::PayloadConfig::new(10 * 1024 * 1024))
             // Main Routes
             .service(hello)
+            .route("/hey", web::get().to(manual_hello))
             .service(get_date)
             .service(echo)
             .service(path_test)
             .service(query_test)
             .service(submit)
-            .route("/hey", web::get().to(manual_hello))
             // DB Routes
             .service(add_temperature)
-            .service(add_temperature_test)
+            .service(get_temperature)
             .service(get_temperature_range)
             .service(add_humidity)
             .service(get_humiditie_range)
@@ -180,7 +204,7 @@ async fn main() -> std::io::Result<()> {
             .service(ws_publish)
     })
     .keep_alive(Duration::from_secs(75))
-    .bind_rustls_0_23(("127.0.0.1", port.parse().unwrap()), tls_config)?
+    .bind_rustls_0_23((host.to_string(), port.parse().unwrap()), tls_config)?
     .run()
     .await
 }
@@ -196,24 +220,54 @@ async fn hello(data: web::Data<AppState>) -> impl Responder {
     HttpResponse::Ok().body(format!("Hello {}, {}", app_name, counter))
 }
 
-#[get("/date")]
-async fn get_date(state: web::Data<AppState>) -> impl Responder {
-    let current_date = chrono::Utc::now().naive_utc().date();
-    HttpResponse::Ok().body(format!("current date : {}", current_date.to_string()))
+/// Manual Route
+async fn manual_hello() -> impl Responder {
+    HttpResponse::Ok().body("Hey there!")
 }
 
+#[get("/date")]
+async fn get_date(state: web::Data<AppState>) -> impl Responder {
+    let date_time = chrono::Utc::now();
+    let date = chrono::Utc::now().naive_utc().date();
+    let time = chrono::Utc::now().time();
+
+    let local_date_time = chrono::Local::now();
+    let local_date = chrono::Local::now().naive_utc().date();
+    let local_time = chrono::Local::now().time();
+
+    HttpResponse::Ok().body(
+        format!("UTC :\ncurrent date + time : {}\ncurrent date : {}\ncurrent time : {}\n\nLocal : \ncurrent date + time : {}\ncurrent date : {}\ncurrent time : {}",
+        date_time.to_string(), date.to_string(), time.to_string(),
+        local_date_time.to_string(), local_date.to_string(), local_time.to_string()))
+}
+
+/// String -> JSON
+#[get("/json")]
+async fn parse_json() -> impl Responder {
+    let json_str = r#"{"temperature": 10}"#;
+    let parsed: Option<Value> = serde_json::from_str(json_str).ok();
+
+    let Some(parsed) = parsed else {
+        return HttpResponse::InternalServerError().body("Failed to parse Sensor JSON");
+    };
+
+    // Check if the root value is a JSON Object
+    if let Some(map) = parsed.as_object() {
+        for (key, value) in map {
+            println!("Key: {}, Value: {}", key, value);
+        }
+    }
+
+    return HttpResponse::Ok().json(parsed);
+}
+
+/// Receive String
 #[post("/echo")]
 async fn echo(req_body: String) -> impl Responder {
     HttpResponse::Ok().body(req_body)
 }
 
-async fn manual_hello() -> impl Responder {
-    HttpResponse::Ok().body("Hey there!")
-}
-
 /// extract path info from "/users/{user_id}/{friend}" url
-/// {user_id} - deserializes to a u32
-/// {friend} - deserializes to a String
 #[get("/users/{user_id}/{friend}")] // <- define path parameters
 async fn path_test(path: web::Path<(u32, String)>) -> actix_web::Result<String> {
     let (user_id, friend) = path.into_inner();
@@ -225,7 +279,7 @@ async fn query_test(info: web::Query<Info>) -> String {
     format!("Welcome {}!", info.username)
 }
 
-/// deserialize `Info` from request's body
+/// Receive JSON
 #[post("/submit")]
 async fn submit(info: web::Json<Info>) -> actix_web::Result<String> {
     Ok(format!("Welcome {}!", info.username))
@@ -235,6 +289,9 @@ async fn submit(info: web::Json<Info>) -> actix_web::Result<String> {
 
 /* #region DB ROUTES */
 
+// CRUD operations per tables
+
+/// Receive a JSON -> Create in DB
 #[post("/temperature")]
 async fn add_temperature(
     state: web::Data<AppState>,
@@ -245,7 +302,7 @@ async fn add_temperature(
     };
 
     let new_entry = temperature::ActiveModel {
-        date: sea_orm::Set(payload.date),
+        date_time: sea_orm::Set(payload.date_time),
         temperature: sea_orm::Set(payload.temperature),
     };
 
@@ -255,66 +312,31 @@ async fn add_temperature(
     }
 }
 
-#[post("/temperature_test")]
-async fn add_temperature_test(state: web::Data<AppState>, payload: String) -> impl Responder {
-    let Some(conn) = &state.conn else {
-        return HttpResponse::InternalServerError().body(format!("No DB Connection"));
-    };
-
-    println!("Received Raw Payload: '{}'", payload);
-
-    // Placeholder data
-    let new_entry = temperature::ActiveModel {
-        date: sea_orm::Set(chrono::NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
-        temperature: sea_orm::Set(25.0),
-    };
-
-    match new_entry.insert(conn).await {
-        Ok(inserted) => HttpResponse::Created().json(inserted),
-        Err(err) => HttpResponse::InternalServerError().body(err.to_string()),
-    }
-}
-
-/// Get the first Temperature in the Date Range
+/// Get Latest temperature
 #[get("/temperature")]
-async fn get_temperature(
-    state: web::Data<AppState>,
-    date_range: web::Query<DateRange>,
-) -> web::Json<Temperature> {
+async fn get_temperature(state: web::Data<AppState>) -> impl Responder {
     let Some(conn) = &state.conn else {
-        let current_date = chrono::Utc::now().naive_utc().date();
-        return web::Json(Temperature {
-            date: current_date,
-            temperature: 20.0,
-        });
+        return HttpResponse::InternalServerError().body("No DB Connection");
     };
 
-    let start_date = date_range.start_date;
-    let end_date = date_range.end_date;
+    let latest_temp = temperature::Entity::find()
+        .order_by_desc(temperature::Column::DateTime)
+        .one(conn)
+        .await;
 
-    // Query between date range
-    let temperatures = temperature::Entity::find()
-        .filter(temperature::Column::Date.between(start_date, end_date))
-        .all(conn)
-        .await
-        .expect("Failed to fetch temperature data");
+    let Ok(latest_temp) = latest_temp else {
+        return HttpResponse::InternalServerError().body("DB Fail");
+    };
 
-    // return first
-    if let Some(temp) = temperatures.first() {
-        web::Json(Temperature {
-            date: temp.date,
-            temperature: temp.temperature,
-        })
-    } else {
-        web::Json(Temperature {
-            date: start_date,
-            temperature: 0.0,
-        })
-    }
+    let Some(latest_temp) = latest_temp else {
+        return HttpResponse::InternalServerError().body("DB Fail");
+    };
+
+    return HttpResponse::Ok().json(latest_temp);
 }
 
 /// Get all Temperatures in the Date Range
-#[get("/temperature")]
+#[get("/temperature/range")]
 async fn get_temperature_range(
     state: web::Data<AppState>,
     date_range: web::Query<DateRange>,
@@ -328,7 +350,7 @@ async fn get_temperature_range(
 
     // Query between date range
     let temperatures = temperature::Entity::find()
-        .filter(temperature::Column::Date.between(start_date, end_date))
+        .filter(temperature::Column::DateTime.between(start_date, end_date))
         .all(conn)
         .await
         .expect("Failed to fetch temperature data");
@@ -337,14 +359,15 @@ async fn get_temperature_range(
 
     for (index, record) in temperatures.into_iter().enumerate() {
         let i = index + 1;
-        map.insert(format!("date{}", i), Value::String(record.date.to_string()));
+        map.insert(
+            format!("date{}", i),
+            Value::String(record.date_time.to_string()),
+        );
         map.insert(format!("temperature{}", i), json!(record.temperature));
     }
 
     HttpResponse::Ok().json(Value::Object(map))
 }
-
-// HUMIDITY ROUTES
 
 #[post("/humidity")]
 async fn add_humidity(state: web::Data<AppState>, payload: web::Json<Humidity>) -> impl Responder {
@@ -353,7 +376,7 @@ async fn add_humidity(state: web::Data<AppState>, payload: web::Json<Humidity>) 
     };
 
     let new_entry = humidity::ActiveModel {
-        date: sea_orm::Set(payload.date),
+        date_time: sea_orm::Set(payload.date_time),
         humidity: sea_orm::Set(payload.humidity),
     };
 
@@ -363,8 +386,31 @@ async fn add_humidity(state: web::Data<AppState>, payload: web::Json<Humidity>) 
     }
 }
 
-/// Get all Humidities in the Date Range
+/// Get Latest humidity
 #[get("/humidity")]
+async fn get_humidity(state: web::Data<AppState>) -> impl Responder {
+    let Some(conn) = &state.conn else {
+        return HttpResponse::InternalServerError().body("No DB Connection");
+    };
+
+    let humidity = temperature::Entity::find()
+        .order_by_desc(temperature::Column::DateTime)
+        .one(conn)
+        .await;
+
+    let Ok(humidity) = humidity else {
+        return HttpResponse::InternalServerError().body("DB Fail");
+    };
+
+    let Some(humidity) = humidity else {
+        return HttpResponse::InternalServerError().body("DB Fail");
+    };
+
+    return HttpResponse::Ok().json(humidity);
+}
+
+/// Get all Humidities in the Date Range
+#[get("/humidity/range")]
 async fn get_humiditie_range(
     state: web::Data<AppState>,
     date_range: web::Query<DateRange>,
@@ -378,7 +424,7 @@ async fn get_humiditie_range(
 
     // Query between date range
     let humidities = humidity::Entity::find()
-        .filter(humidity::Column::Date.between(start_date, end_date))
+        .filter(humidity::Column::DateTime.between(start_date, end_date))
         .all(conn)
         .await
         .expect("Failed to fetch humidity data");
@@ -387,7 +433,7 @@ async fn get_humiditie_range(
         .into_iter()
         .map(|record| {
             json!({
-                "date": record.date.to_string(),
+                "date": record.date_time.to_string(),
                 "humidity": record.humidity,
             })
         })
@@ -395,6 +441,10 @@ async fn get_humiditie_range(
 
     HttpResponse::Ok().json(response)
 }
+
+// TODO : Users
+
+// TODO : simple items
 
 /* #endregion */
 

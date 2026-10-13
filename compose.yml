@@ -1,0 +1,41 @@
+services:
+  postgres-db:
+    image: postgres:18.6
+    restart: always
+    # set shared memory limit when using docker compose
+    shm_size: 128mb
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-db}
+      POSTGRES_USER: ${POSTGRES_USER:-username}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U your_user -d your_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: actix-testlab:1.0.0
+    environment:
+      HOST: ${HOST:-0.0.0.0}
+      PORT: ${API_PORT:-8080}
+      DATABASE_URL: postgres://${POSTGRES_USER:-username}:${POSTGRES_PASSWORD:-password}@postgres-db:5432/${POSTGRES_DB:-db}
+    ports:
+      - "${API_PORT:-8080}:8080"
+    volumes:
+      # - cert_volume:/app/certs
+      - ./certs:/app/certs
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+      # db-init: # TODO
+      #   condition: service_completed_successfully
+    restart: no # unless-stopped
+
+# TODO : Use volumes in end game setup
+# volumes:
+#   cert_volume:
