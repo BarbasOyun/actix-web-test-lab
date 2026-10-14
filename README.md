@@ -39,3 +39,12 @@ curl -k -X POST https://127.0.0.1:8080/temperature -H "Content-Type: application
 
 -Get Latest Temperature :<br>
 https://localhost:8080/temperature<br>
+
+### Websocket
+
+-Text Message socket :<br>
+websocat -k wss://127.0.0.1:8080/message<br>
+
+-Video Websocket :
+1] run API
+2] use index.html in streamer + client folders

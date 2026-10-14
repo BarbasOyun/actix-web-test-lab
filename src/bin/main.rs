@@ -1,4 +1,5 @@
 use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, Responder, get, post, web};
+use actix_web_actors::ws;
 use chrono;
 use dotenvy::dotenv;
 use std::{env, fs::File, io::BufReader, sync::Mutex, time::Duration};
@@ -84,6 +85,7 @@ struct AppState {
     conn: Option<DatabaseConnection>,
     tx: broadcast::Sender<Vec<u8>>,
     counter: Mutex<i32>, // <- Mutex is necessary to mutate safely across threads
+    header: Mutex<Option<Vec<u8>>>, // Stores initial WebM header
 }
 
 async fn db_connection() -> Option<DatabaseConnection> {
@@ -171,6 +173,7 @@ async fn main() -> std::io::Result<()> {
         conn,
         tx,
         counter: Mutex::new(0),
+        header: Mutex::new(Option::None),
     });
 
     // TLS / HTTPS
@@ -224,7 +227,7 @@ async fn manual_hello() -> impl Responder {
 }
 
 #[get("/date")]
-async fn get_date(state: web::Data<AppState>) -> impl Responder {
+async fn get_date() -> impl Responder {
     let date_time = chrono::Utc::now();
     let date = chrono::Utc::now().naive_utc().date();
     let time = chrono::Utc::now().time();
@@ -451,7 +454,7 @@ async fn get_humiditie_range(
 /// Connect to a Socket and Send Text Messages
 #[get("/message")]
 pub async fn ws_publish(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error> {
-    println!("Connection Attempt");
+    println!("Connection to Message");
     let (response, mut session, mut msg_stream) = actix_ws::handle(&req, stream)?;
 
     actix_web::rt::spawn(async move {
@@ -481,13 +484,21 @@ async fn publish_stream(
     stream: web::Payload,
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
-    println!("Stream Connection");
-    let (response, session, mut msg_stream) = actix_ws::handle(&req, stream)?;
+    println!("1] Stream Connection");
 
+    // Set Max frame size :
+    // Help : https://github.com/actix/actix-extras/discussions/491
+    // Example : https://github.com/actix/actix-extras/blob/18f94fa8b54453ac79cfe2ea04bcb8d7c10acb81/actix-ws/examples/chat.rs#L71
+    // StackOverFlow : https://stackoverflow.com/questions/77207464/how-to-set-message-size-limit-for-actix-websocket-actorless
+
+    let (response, session, msg_stream) = actix_ws::handle(&req, stream)?;
+    // let mut msg_stream = msg_stream.max_frame_size(128 * 1024).aggregate_continuations();
+    let mut msg_stream = msg_stream.max_frame_size(128 * 1024);
     let tx = state.tx.clone();
 
     actix_web::rt::spawn(async move {
         let mut session = session;
+        let mut is_first_conn = true;
 
         while let Some(res) = msg_stream.next().await {
             match res {
@@ -498,8 +509,15 @@ async fn publish_stream(
                     }
                 }
                 Ok(actix_ws::Message::Binary(bytes)) => {
-                    // Broadcast raw video chunk to all active consumers
-                    println!("Received video chunk: {} bytes", bytes.len());
+                    if is_first_conn {
+                        if let Ok(mut header_guard) = state.header.lock() {
+                            *header_guard = Some(bytes.to_vec().clone());
+                        }
+                        is_first_conn = false;
+                    }
+
+                    // Broadcast raw video bytes to channels
+                    // println!("Received video chunk: {} bytes", bytes.len());
                     let _ = tx.send(bytes.to_vec());
                 }
                 Ok(actix_ws::Message::Close(reason)) => {
@@ -525,13 +543,25 @@ async fn subscribe_stream(
     req: HttpRequest,
     stream: web::Payload,
     data: web::Data<AppState>,
+    state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
+    println!("2] Watch Connection");
     let (res, session, _msg_stream) = actix_ws::handle(&req, stream)?;
-
     let mut rx = data.tx.subscribe();
+
+    let initial_header = state.header.lock().ok().and_then(|h| h.clone());
 
     actix_web::rt::spawn(async move {
         let mut session = session;
+
+        if let Some(header) = initial_header {
+            println!("Sending initial header");
+
+            if session.binary(header).await.is_err() {
+                println!("Session header error");
+                return;
+            }
+        }
 
         while let Ok(bytes) = rx.recv().await {
             if session.binary(bytes).await.is_err() {
