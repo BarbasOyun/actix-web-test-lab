@@ -1,5 +1,3 @@
-mod db_init;
-
 use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, Responder, get, post, web};
 use chrono;
 use dotenvy::dotenv;

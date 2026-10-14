@@ -17,9 +17,11 @@ RUN apt-get update && apt-get install -y \
 COPY --from=planner /app/recipe.json recipe.json
 # Build dependencies - this is the caching layer
 RUN cargo chef cook --release --recipe-path recipe.json
+
 # Build application
 COPY . .
-RUN cargo build --release --bin actix-test-lab
+# RUN cargo build --release --bin actix-test-lab
+RUN cargo build --release --bin main --bin db_init
 
 # 3. Runtime Stage
 FROM debian:bookworm-slim AS runtime
