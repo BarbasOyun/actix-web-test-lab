@@ -3,6 +3,14 @@ name = "actix-test-lab"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "actix-test-lab"
+path = "src/bin/main.rs"
+
+[[bin]]
+name = "db_init"
+path = "src/bin/db_init.rs"
+
 [dependencies]
 actix-web = { version = "4.15.0", features = ["rustls-0_23"] }
 rustls = "0.23"

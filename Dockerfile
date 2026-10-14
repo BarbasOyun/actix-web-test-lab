@@ -21,7 +21,8 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # Build application
 COPY . .
 # RUN cargo build --release --bin actix-test-lab
-RUN cargo build --release --bin main --bin db_init
+RUN cargo build --release --bin actix-test-lab --bin db_init
+# RUN cargo build --release --bin main --bin db_init
 
 # 3. Runtime Stage
 FROM debian:bookworm-slim AS runtime
@@ -32,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/actix-test-lab /app/actix-test-lab
+COPY --from=builder /app/target/release/db_init /app/db_init
 
 EXPOSE 8080
 CMD ["/app/actix-test-lab"]
