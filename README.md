@@ -48,3 +48,7 @@ websocat -k wss://127.0.0.1:8080/message<br>
 -Video Websocket :
 1] run API
 2] use index.html in streamer + client folders
+
+## Progress
+
+-![Paint](assets/StreamingWebSocket.png)<br>

@@ -1,8 +1,9 @@
 use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, Responder, get, post, web};
-use actix_web_actors::ws;
+use actix_ws::{AggregatedMessage, Message, Session};
 use chrono;
 use dotenvy::dotenv;
 use std::{env, fs::File, io::BufReader, sync::Mutex, time::Duration};
+use tokio::sync::broadcast::error::RecvError;
 
 // DB Interaction
 use sea_orm::{
@@ -83,9 +84,11 @@ struct DateRange {
 struct AppState {
     app_name: String,
     conn: Option<DatabaseConnection>,
-    tx: broadcast::Sender<Vec<u8>>,
     counter: Mutex<i32>, // <- Mutex is necessary to mutate safely across threads
-    header: Mutex<Option<Vec<u8>>>, // Stores initial WebM header
+    // Websocket
+    // session: Session
+    latest_keyframe: Mutex<Option<Vec<u8>>>,
+    tx: broadcast::Sender<Vec<u8>>,
 }
 
 async fn db_connection() -> Option<DatabaseConnection> {
@@ -173,7 +176,7 @@ async fn main() -> std::io::Result<()> {
         conn,
         tx,
         counter: Mutex::new(0),
-        header: Mutex::new(Option::None),
+        latest_keyframe: Mutex::new(Option::None),
     });
 
     // TLS / HTTPS
@@ -461,14 +464,14 @@ pub async fn ws_publish(req: HttpRequest, stream: web::Payload) -> Result<HttpRe
         while let Some(Ok(msg)) = msg_stream.next().await {
             println!("Message");
             match msg {
-                actix_ws::Message::Text(text) => println!("Received: {text}"),
-                actix_ws::Message::Ping(bytes) => {
+                Message::Text(text) => println!("Received: {text}"),
+                Message::Ping(bytes) => {
                     if session.pong(&bytes).await.is_err() {
                         println!("Ping Error");
                         break;
                     }
                 }
-                actix_ws::Message::Close(reason) => break,
+                Message::Close(reason) => break,
                 _ => (),
             }
         }
@@ -492,40 +495,45 @@ async fn publish_stream(
     // StackOverFlow : https://stackoverflow.com/questions/77207464/how-to-set-message-size-limit-for-actix-websocket-actorless
 
     let (response, session, msg_stream) = actix_ws::handle(&req, stream)?;
-    // let mut msg_stream = msg_stream.max_frame_size(128 * 1024).aggregate_continuations();
-    let mut msg_stream = msg_stream.max_frame_size(128 * 1024);
+    let mut msg_stream = msg_stream
+        .max_frame_size(1024 * 1024) // 128 *
+        .aggregate_continuations();
+    // let mut msg_stream = msg_stream.max_frame_size(128 * 1024);
     let tx = state.tx.clone();
+
+    // state.insert(session.clone()).await; // Save Session
 
     actix_web::rt::spawn(async move {
         let mut session = session;
-        let mut is_first_conn = true;
 
         while let Some(res) = msg_stream.next().await {
             match res {
-                Ok(actix_ws::Message::Ping(bytes)) => {
+                Ok(AggregatedMessage::Ping(bytes)) => {
                     if session.pong(&bytes).await.is_err() {
                         println!("Ping Error");
                         break;
                     }
                 }
-                Ok(actix_ws::Message::Binary(bytes)) => {
-                    if is_first_conn {
-                        if let Ok(mut header_guard) = state.header.lock() {
-                            *header_guard = Some(bytes.to_vec().clone());
+                Ok(AggregatedMessage::Binary(bytes)) => {
+                    let is_keyframe = bytes.len() >= 5_000;
+
+                    if is_keyframe {
+                        if let Ok(mut latest_keyframe_guard) = state.latest_keyframe.lock() {
+                            println!("Save Keyframe");
+                            *latest_keyframe_guard = Some(bytes.to_vec().clone());
                         }
-                        is_first_conn = false;
                     }
 
                     // Broadcast raw video bytes to channels
-                    // println!("Received video chunk: {} bytes", bytes.len());
+                    println!("Received video chunk: {} bytes", bytes.len());
                     let _ = tx.send(bytes.to_vec());
                 }
-                Ok(actix_ws::Message::Close(reason)) => {
+                Ok(AggregatedMessage::Close(reason)) => {
                     let _ = session.close(reason).await;
                     break;
                 }
                 Err(err) => {
-                    println!("WebSocket Frame Error: {:?}", err);
+                    println!("WebSocket Error: {:?}", err);
                     break;
                 }
                 _ => {}
@@ -549,24 +557,37 @@ async fn subscribe_stream(
     let (res, session, _msg_stream) = actix_ws::handle(&req, stream)?;
     let mut rx = data.tx.subscribe();
 
-    let initial_header = state.header.lock().ok().and_then(|h| h.clone());
+    let latest_keyframe = state.latest_keyframe.lock().ok().and_then(|h| h.clone());
 
     actix_web::rt::spawn(async move {
         let mut session = session;
 
-        if let Some(header) = initial_header {
-            println!("Sending initial header");
+        // Send latest_keyframe
+        if let Some(latest_keyframe) = latest_keyframe {
+            println!("Sending latest_keyframe");
 
-            if session.binary(header).await.is_err() {
-                println!("Session header error");
+            if let Err(err) = session.binary(latest_keyframe).await {
+                println!("Session latest_keyframe error : {}", err);
                 return;
             }
         }
 
-        while let Ok(bytes) = rx.recv().await {
-            if session.binary(bytes).await.is_err() {
-                println!("Stopped Watching");
-                break;
+        loop {
+            match rx.recv().await {
+                Ok(bytes) => {
+                    if let Err(err) = session.binary(bytes).await {
+                        println!("Error sending Image: {}", err);
+                        break;
+                    }
+                }
+                Err(RecvError::Lagged(skipped)) => {
+                    println!("Watcher lagged behind, skipped {} frames", skipped);
+                    continue;
+                }
+                Err(RecvError::Closed) => {
+                    println!("Streamer channel closed");
+                    break;
+                }
             }
         }
     });
