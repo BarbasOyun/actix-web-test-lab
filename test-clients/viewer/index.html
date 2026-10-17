@@ -64,7 +64,7 @@
                 if (!hasStartedPlaying && sourceBuffer.buffered.length > 0) {
                     video.play().then(() => {
                         hasStartedPlaying = true;
-                        console.log("Playback started successfully");
+                        console.log("Play video");
                     }).catch(err => {
                         console.warn("Autoplay deferred or waiting for interaction:", err);
                     });

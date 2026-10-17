@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Webcodec</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            margin: 2rem;
+            background: #1a1a1a;
+            color: #fff;
+        }
+
+        video {
+            width: 480px;
+            height: 360px;
+            background: #000;
+            border-radius: 8px;
+        }
+
+        button {
+            padding: 0.6rem 1.2rem;
+            font-size: 1rem;
+            cursor: pointer;
+            margin-right: 0.5rem;
+        }
+
+        #log {
+            background: #111;
+            padding: 1rem;
+            border-radius: 6px;
+            font-family: monospace;
+            height: 150px;
+            overflow-y: auto;
+            margin-top: 1rem;
+        }
+    </style>
+</head>
+
+<body>
+    <h2>Webcam Binary WebSocket Streamer</h2>
+
+    <video id="webcam" autoplay playsinline muted></video>
+    <br /><br />
+
+    <button id="startBtn">Start Streaming</button>
+    <button id="stopBtn" disabled>Stop</button>
+
+    <div id="log"></div>
+
+    <script>
+        const video = document.getElementById('webcam');
+        const logEl = document.getElementById('log');
+
+        function log(msg) {
+            logEl.innerHTML += `[${new Date().toLocaleTimeString()}] ${msg}<br/>`;
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        let socket, stream;
+
+        function connectToWebsocket() {
+            socket = new WebSocket('wss://127.0.0.1:8080/stream');
+            socket.binaryType = 'arraybuffer'; // Handle raw bytes
+
+            socket.onopen = () => log('WebSocket Connected');
+            socket.onerror = (e) => log('WebSocket Error');
+            socket.onclose = () => log('WebSocket Closed');
+        }
+
+        async function startWebCodecsStream() {
+            connectToWebsocket();
+
+            // 2. Get user media stream
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: { width: 640, height: 480, frameRate: 60 },
+                audio: false
+            });
+            // document.getElementById('webcam').srcObject = stream;
+
+            // Setup feedback video
+            video.srcObject = stream;
+            await video.play();
+
+            // const videoTrack = stream.getVideoTracks()[0];
+
+            // 3. Set up MediaStreamTrackProcessor to read raw VideoFrames from the stream
+            // const processor = new MediaStreamTrackProcessor({ track: videoTrack });
+            // const reader = processor.readable.getReader();
+
+            let frameCount = 0;
+            const fps = 60;
+            const keyframeInterval = fps * 2; // Every 2 seconds (60 frames at 30fps)
+
+            // 4. Configure the WebCodecs VideoEncoder
+            const encoder = new VideoEncoder({
+                output: (chunk, metadata) => {
+                    // Custom payload
+                    // -> Can be replaced by checking bytes size backend side
+                    // const isKey = chunk.type === 'key';
+
+                    // // Prepend custom byte header for Actix: 
+                    // // [1 = Keyframe (cached by server), 2 = Delta (live stream only)]
+                    // const header = new Uint8Array([isKey ? 1 : 2]);
+                    // const chunkData = new Uint8Array(chunk.byteLength);
+                    // chunk.copyTo(chunkData);
+
+                    // // Combine header + payload
+                    // const payload = new Uint8Array(header.length + chunkData.length);
+                    // payload.set(header, 0);
+                    // payload.set(chunkData, header.length);
+
+                    const buffer = new ArrayBuffer(chunk.byteLength);
+                    chunk.copyTo(buffer);
+
+                    if (socket.readyState === WebSocket.OPEN) {
+                        // log(`Sending binary chunk: ${payload.byteLength} bytes`);
+                        // socket.send(payload);
+
+                        // log(`Sending binary chunk: ${chunk.byteLength} bytes`);
+                        // socket.send(chunk);
+
+                        log(`Sending binary chunk: ${buffer.byteLength} bytes`);
+                        socket.send(buffer);
+                    }
+                },
+                error: (err) => console.error("WebCodecs Encoding Error:", err)
+            });
+
+            encoder.configure({
+                codec: 'vp8',
+                width: 640,
+                height: 480,
+                bitrate: 1_000_000,
+                framerate: fps,
+            });
+
+            // 5. Processing Loop
+            // try {
+            //     while (true) {
+            //         const { value: videoFrame, done } = await reader.read();
+            //         if (done) break;
+
+            //         if (encoder.state === 'closed') {
+            //             videoFrame.close();
+            //             break;
+            //         }
+
+            //         // Force a keyframe every ~2 seconds
+            //         const forceKey = (frameCount % keyframeInterval === 0);
+
+            //         // Encode the frame
+            //         encoder.encode(videoFrame, { keyFrame: forceKey });
+            //         videoFrame.close();
+
+            //         frameCount++;
+            //     }
+            // } catch (error) {
+            //     console.error("Stream processing error:", error);
+            // }
+
+            // 5. Frame-by-frame callback loop
+            const renderLoop = async (now, metadata) => {
+                if (encoder.state === 'closed') return;
+
+                // Create a VideoFrame directly from the playing video element
+                const frame = new VideoFrame(video, { timestamp: metadata.mediaTime * 1_000_000 });
+
+                // Force a keyframe every ~2 seconds
+                const forceKey = (frameCount % keyframeInterval === 0);
+
+                encoder.encode(frame, { keyFrame: forceKey });
+                frame.close(); // Clean up memory
+
+                frameCount++;
+
+                // Keep the loop going for the next frame
+                video.requestVideoFrameCallback(renderLoop);
+            };
+
+            // Kick off the loop
+            video.requestVideoFrameCallback(renderLoop);
+        }
+
+        function stopStream() {
+            if (stream) stream.getTracks().forEach(t => t.stop());
+            if (socket) socket.close();
+            log('Streaming stopped');
+        }
+
+        // Setup buttons
+        document.getElementById('startBtn').onclick = async () => {
+            startWebCodecsStream();
+
+            document.getElementById('startBtn').disabled = true;
+            document.getElementById('stopBtn').disabled = false;
+        };
+        document.getElementById('stopBtn').onclick = () => {
+            stopStream();
+
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+        };
+    </script>
+</body>
+
+</html>

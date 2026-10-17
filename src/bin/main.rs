@@ -525,7 +525,7 @@ async fn publish_stream(
                     }
 
                     // Broadcast raw video bytes to channels
-                    println!("Received video chunk: {} bytes", bytes.len());
+                    // println!("Received video chunk: {} bytes", bytes.len());
                     let _ = tx.send(bytes.to_vec());
                 }
                 Ok(AggregatedMessage::Close(reason)) => {

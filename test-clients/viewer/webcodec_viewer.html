@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Live Stream Viewer</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            background: #121212;
+            color: #fff;
+            padding: 2rem;
+        }
+
+        video {
+            width: 640px;
+            height: 480px;
+            background: #000;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+
+<body>
+    <h2>Live Stream Viewer</h2>
+    <video id="player" autoplay controls playsinline></video>
+    <p id="status">Connecting...</p>
+
+    <script>
+        const video = document.getElementById('player');
+        const status = document.getElementById('status');
+
+        // Media Source
+        const mediaSource = new MediaSource();
+        video.src = URL.createObjectURL(mediaSource);
+
+        mediaSource.addEventListener('sourceopen', () => {
+            console.log("---Starting Video");
+            // mediaSource.duration = 5;
+
+            // Streamer + Watcher = video/webm; codecs=vp8
+            const sourceBuffer = mediaSource.addSourceBuffer('video/webm; codecs=vp8');
+            sourceBuffer.mode = 'sequence';
+
+            const queue = [];
+            let hasStartedPlaying = false;
+
+            // Queue bytes -> video buffer
+            function processQueue() {
+                if (queue.length > 0 && !sourceBuffer.updating) {
+                    const chunk = queue.shift();
+                    try {
+                        sourceBuffer.appendBuffer(chunk);
+                        console.log("Received image : ", chunk);
+                    } catch (e) {
+                        console.error("Error appending buffer:", e);
+                    }
+                }
+            }
+
+            sourceBuffer.addEventListener('updateend', () => {
+                processQueue()
+
+                if (!hasStartedPlaying && sourceBuffer.buffered.length > 0) {
+                    video.play().then(() => {
+                        hasStartedPlaying = true;
+                        console.log("Play video");
+                    }).catch(err => {
+                        console.warn("Autoplay deferred or waiting for interaction:", err);
+                    });
+                }
+            });
+
+            sourceBuffer.addEventListener('error', () => {
+                console.error("SourceBuffer failed to parse the appended media data");
+            });
+
+            // Websocket
+            const ws = new WebSocket('wss://127.0.0.1:8080/watch');
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => { status.innerText = 'Connected - Watching live...'; };
+            ws.onclose = () => { status.innerText = 'Disconnected'; };
+            ws.onerror = (e) => { status.innerText = 'WebSocket Error' + e; };
+
+            ws.onmessage = (event) => {
+                // console.log("WS Message");
+                if (event.data instanceof ArrayBuffer) {
+                    queue.push(event.data);
+                    processQueue();
+                }
+            };
+        });
+    </script>
+</body>
+
+</html>
